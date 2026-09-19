@@ -1,0 +1,6 @@
+{
+  "name": "overbyte", "version": "1.0.0", "private": true, "type": "module",
+  "description": "Persistent business inventory and surplus marketplace",
+  "engines": { "node": ">=24" },
+  "scripts": { "start": "node server.mjs" }
+}

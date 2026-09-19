@@ -1,0 +1,11 @@
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+node_modules/
+.env
+.env.*
+!.env.example
+public/
+.vercel/

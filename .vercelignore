@@ -1,0 +1,13 @@
+# Only deployment source is uploaded. Database files and archives stay local.
+/*
+!api/
+!server/
+!src/
+!styles/
+!assets/
+!scripts/
+!index.html
+!server.mjs
+!package.json
+!package-lock.json
+!vercel.json
