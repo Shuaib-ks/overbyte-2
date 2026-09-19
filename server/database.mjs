@@ -4,6 +4,13 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 const require = createRequire(import.meta.url);
+export class DatabaseInitializationError extends Error {
+  constructor(stage, cause) {
+    super(`Database initialization failed during ${stage}.`, { cause });
+    this.name = "DatabaseInitializationError";
+    this.stage = stage;
+  }
+}
 export const schema = `
   CREATE TABLE IF NOT EXISTS businesses(id TEXT PRIMARY KEY,name TEXT NOT NULL,type TEXT NOT NULL,loc TEXT NOT NULL,owner TEXT DEFAULT '',contact TEXT DEFAULT '',pickup TEXT DEFAULT '',lat REAL,lng REAL,onboarded INTEGER DEFAULT 0,settings TEXT DEFAULT '{}',created_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,business_id TEXT NOT NULL REFERENCES businesses(id),email TEXT UNIQUE NOT NULL COLLATE NOCASE,password_hash TEXT NOT NULL,created_at TEXT NOT NULL);
@@ -37,6 +44,32 @@ export const schema = `
   CREATE INDEX IF NOT EXISTS orders_buyer_status ON orders(buyer_id,status);
   CREATE INDEX IF NOT EXISTS orders_seller_status ON orders(seller_id,status);
 `;
+
+// Inspect actual schema objects rather than depending on a PRAGMA version or
+// assuming a previous migration finished. Every statement is additive and safe
+// to replay if another function instance initialized the same database first.
+const schemaObjects = schema.split(";").map((sql) => sql.trim()).filter(Boolean).map((sql) => {
+  const match = /^CREATE (TABLE|INDEX) IF NOT EXISTS (\w+)/i.exec(sql);
+  if (!match) throw new Error("Unrecognized OverByte schema statement.");
+  return { sql, type: match[1].toLowerCase(), name: match[2] };
+});
+
+export function initializeSchema(db) {
+  let existing;
+  try {
+    existing = new Set(db.prepare(
+      "SELECT type,name FROM sqlite_master WHERE type IN ('table','index')",
+    ).all().map((row) => `${row.type}:${row.name}`));
+  } catch (error) {
+    throw new DatabaseInitializationError("schema_inspection", error);
+  }
+  const missing = schemaObjects.filter((object) => !existing.has(`${object.type}:${object.name}`));
+  try {
+    if (missing.length) db.exec(missing.map((object) => object.sql + ";").join("\n"));
+  } catch (error) {
+    throw new DatabaseInitializationError("schema_migration", error);
+  }
+}
 
 /** Hosted instances must use durable remote storage, never their temporary disk. */
 export function databaseConfig(env = process.env) {
@@ -73,38 +106,31 @@ export function databaseConfig(env = process.env) {
 }
 
 export function openDatabase(filename = ":memory:", options = {}) {
-  const config = options.config || databaseConfig(options.env);
   let db;
-  if (config.url) {
-    const Database = require("libsql");
-    db = new Database(config.url, { authToken: config.authToken });
-  } else {
-    if (filename !== ":memory:")
-      mkdirSync(dirname(filename), { recursive: true });
-    const Database =
-      config.driver === "libsql" ? require("libsql") : DatabaseSync;
-    db = new Database(filename);
-    db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
-  }
+  let stage = "configuration";
   try {
-    db.exec("PRAGMA foreign_keys=ON;");
-    // Schema DDL is expensive over a remote connection. A Vercel cold start
-    // only needs one metadata read after the initial (idempotent) migration.
-    const version = Number(db.prepare("PRAGMA user_version").get()?.user_version) || 0;
-    if (version < 1) {
-      db.exec(schema);
-      db.exec("PRAGMA user_version=2;");
-    } else if (version < 2) {
-      db.exec(`CREATE INDEX IF NOT EXISTS inventory_transactions_business_kind_time ON inventory_transactions(business_id,kind,created_at);
-        CREATE INDEX IF NOT EXISTS listings_business_status_expiry ON listings(business_id,status,expires_at);
-        CREATE INDEX IF NOT EXISTS orders_buyer_status ON orders(buyer_id,status);
-        CREATE INDEX IF NOT EXISTS orders_seller_status ON orders(seller_id,status);`);
-      db.exec("PRAGMA user_version=2;");
+    const config = options.config || databaseConfig(options.env);
+    stage = "driver_load";
+    const Database = config.url || config.driver === "libsql" ? require("libsql") : DatabaseSync;
+    stage = "connection";
+    if (config.url) {
+      db = new Database(config.url, { authToken: config.authToken });
+    } else {
+      if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
+      db = new Database(filename);
+      stage = "local_settings";
+      db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
     }
+    stage = "foreign_keys";
+    db.exec("PRAGMA foreign_keys=ON;");
+    stage = "schema_initialization";
+    initializeSchema(db);
     return db;
   } catch (error) {
-    db.close();
-    throw error;
+    // Cleanup must not replace the exception that explains the outage.
+    try { db?.close(); } catch {}
+    if (error instanceof DatabaseInitializationError) throw error;
+    throw new DatabaseInitializationError(stage, error);
   }
 }
 

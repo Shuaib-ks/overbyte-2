@@ -5,7 +5,9 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { databaseConfig, openDatabase, transaction } from '../server/database.mjs';
+import { databaseConfig, openDatabase, transaction, initializeSchema, DatabaseInitializationError } from '../server/database.mjs';
+import { describeError } from '../server/diagnostics.mjs';
+import { createServerlessHandler } from '../api/index.mjs';
 import { Service } from '../server/service.mjs';
 import { createApp } from '../server.mjs';
 
@@ -89,7 +91,8 @@ test('existing databases migrate idempotency storage and query indexes without l
   t.after(async () => { db.close(); await rm(directory, { recursive: true, force: true }); });
   const service = new Service(db), user = service.signup(credentials()).user;
   const original = service.addInventory(user.business_id, inventory());
-  db.exec('DROP TABLE inventory_create_requests; DROP INDEX inventory_transactions_business_kind_time; PRAGMA user_version=0;');
+  // An interrupted old migration may claim completion while objects are missing.
+  db.exec('DROP TABLE inventory_create_requests; DROP INDEX inventory_transactions_business_kind_time; PRAGMA user_version=2;');
   db.close();
   db = openDatabase(filename, { config: { driver: 'sqlite' } });
   assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
@@ -97,6 +100,62 @@ test('existing databases migrate idempotency storage and query indexes without l
   assert.ok(db.prepare('SELECT id FROM inventory WHERE id=?').get(original.id));
   assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name='inventory_create_requests'").get());
   assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name='inventory_transactions_business_kind_time'").get());
+});
+
+test('complete schemas avoid repeated DDL and failed inspection preserves its exact cause', (t) => {
+  const db = openDatabase(':memory:', { config: { driver: 'sqlite' } });
+  t.after(() => db.close());
+  let writes = 0;
+  initializeSchema({ prepare: (sql) => db.prepare(sql), exec: () => { writes++; } });
+  assert.equal(writes, 0);
+  const cause = new Error('remote describe failed');
+  assert.throws(() => initializeSchema({ prepare() { throw cause; } }),
+    (error) => error.stage === 'schema_inspection' && error.cause === cause);
+  const failing = {
+    prepare: () => ({ all: () => [] }),
+    exec() { throw cause; },
+  };
+  assert.throws(() => initializeSchema(failing),
+    (error) => error.stage === 'schema_migration' && error.cause === cause);
+});
+
+test('startup diagnostics retain driver messages and redact credentials in nested causes', () => {
+  const token = 'private-test-token';
+  const source = new Error(`HTTP 401 at libsql://secret-host.turso.io; Bearer ${token}; authToken=extra-secret`);
+  source.code = 'REMOTE_UNAUTHORIZED';
+  const error = new DatabaseInitializationError('foreign_keys', source);
+  const logged = JSON.stringify(describeError(error, { TURSO_AUTH_TOKEN: token }));
+  assert.match(logged, /foreign_keys/);
+  assert.match(logged, /HTTP 401/);
+  assert.match(logged, /REMOTE_UNAUTHORIZED/);
+  assert.doesNotMatch(logged, /private-test-token|secret-host|extra-secret/);
+});
+
+test('a failed cold start logs its cause, returns a reference, and retries on the next request', async () => {
+  const entries = [];
+  let attempts = 0, calls = 0;
+  const handler = createServerlessHandler(() => {
+    attempts++;
+    if (attempts === 1) throw new DatabaseInitializationError('connection', new Error('remote transport refused connection'));
+    return { handler() { calls++; } };
+  }, { error: (line) => entries.push(JSON.parse(line)), info: (line) => entries.push(JSON.parse(line)) });
+  const response = {
+    writeHead(status, headers) { this.status = status; this.headers = headers; },
+    end(body) { this.body = JSON.parse(body); },
+  };
+  await handler({}, response);
+  assert.equal(response.status, 503);
+  assert.equal(response.body.requestId, response.headers['X-Request-Id']);
+  assert.equal(response.body.code, 'DATABASE_INITIALIZATION_FAILED');
+  assert.doesNotMatch(response.body.error, /remote transport refused/);
+  const failure = entries.find((entry) => entry.event === 'overbyte.initialization_error');
+  assert.equal(failure.requestId, response.body.requestId);
+  assert.equal(failure.error.stage, 'connection');
+  assert.equal(failure.error.cause.message, 'remote transport refused connection');
+  await handler({}, {});
+  await handler({}, {});
+  assert.equal(attempts, 2, 'only a successful instance may be reused');
+  assert.equal(calls, 2);
 });
 
 test('native libsql driver supports schema constraints and all-or-nothing service transactions', (t) => {
