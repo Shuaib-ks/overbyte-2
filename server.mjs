@@ -4,6 +4,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import { resolve, dirname, extname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDatabase } from "./server/database.mjs";
+import { describeError } from "./server/diagnostics.mjs";
 import { Service, HttpError } from "./server/service.mjs";
 const root = dirname(fileURLToPath(import.meta.url));
 const cookieToken = (req) =>
@@ -47,6 +48,7 @@ export function createApp({
     const requestId = randomUUID();
     const timing = { requestId, dbCalls: 0, dbMs: 0, stateMs: 0, mutationMs: 0 };
     let apiPath = "";
+    let mutationStarted;
     res.setHeader("X-Request-Id", requestId);
     const stateFor = (user) => {
       const start = performance.now();
@@ -191,7 +193,7 @@ export function createApp({
           throw new HttpError(404, "Endpoint not found.");
         const b = user.business_id;
         let result, m;
-        const mutationStarted = performance.now();
+        mutationStarted = performance.now();
         if (path === "/api/inventory" && req.method === "POST")
           result = service.addInventory(b, p);
         else if (
@@ -269,6 +271,7 @@ export function createApp({
           result = service.watch(b, p);
         else throw new HttpError(404, "Endpoint not found.");
         timing.mutationMs = performance.now() - mutationStarted;
+        mutationStarted = undefined;
         return json(res, 200, { result, state: stateFor(user) });
       }
       if (!["GET", "HEAD"].includes(req.method))
@@ -293,7 +296,10 @@ export function createApp({
       res.end(req.method === "HEAD" ? undefined : await readFile(actual));
     } catch (e) {
       if (e.status === undefined && e.code !== "ENOENT")
-        console.error(JSON.stringify({ event: "overbyte.api_error", requestId, code: e.code || e.name || "Error" }));
+        console.error(JSON.stringify({
+          event: "overbyte.api_error", requestId, method: req.method,
+          path: apiPath, error: describeError(e),
+        }));
       if (!res.headersSent) {
         const storageError = /^(SQLITE|LIBSQL|HRANA|ETIMEDOUT|ECONN)/i.test(String(e.code || ""));
         json(res, e.status || (e.code === "ENOENT" ? 404 : storageError ? 503 : 500), {
@@ -308,6 +314,9 @@ export function createApp({
       }
       else res.end();
     } finally {
+      // Include failed writes, not just mutations that returned successfully.
+      if (mutationStarted !== undefined)
+        timing.mutationMs = performance.now() - mutationStarted;
       if (apiPath) console.info(JSON.stringify({
         event: "overbyte.api_timing", requestId, method: req.method,
         path: apiPath, status: res.statusCode,

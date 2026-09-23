@@ -64,6 +64,8 @@ Major endpoints: `/api/auth/signup`, `/api/auth/login`, `/api/auth/logout`, `/ap
 
 API functions emit structured `overbyte.api_timing` logs with a request ID, route, status, total duration, database call count/time, state-render time, and mutation time. `overbyte.database_init` measures cold-start database initialization and `overbyte.slow_query` identifies individual calls over 500 ms without recording SQL parameters or credentials. The response's `X-Request-Id` matches its timing log. If latency persists after deployment, compare cold-start time and `dbMs` with total duration, then inspect slow-query entries and the Turso database region/connectivity. Local SQLite tests do not measure the deployed database's network latency.
 
+Runtime failures emit `overbyte.api_error` with the same request ID, route, and a sanitized `error.message`/`error.cause`, including driver errors without a code. Detailed causes stay in server logs, not public responses. Mutation timing includes failed writes as well as successful ones.
+
 For startup failures, find `overbyte.initialization_error` using the response's request ID. Its `error.stage` identifies configuration, driver loading, connection, foreign-key setup, schema inspection, or schema migration; `error.cause.message` retains the driver's explanation with tokens and connection URLs redacted. `overbyte.database_init.ok` distinguishes success from failure. A failed initialization is retried on the next request. Schema initialization checks actual tables and indexes and creates only missing objects, so an outdated or prematurely advanced `PRAGMA user_version` cannot skip required tables. The test suite also exercises the native driver's HTTP transport against an isolated Hrana fixture; this does not verify production credentials or Turso's server policy.
 
 ## Verification
@@ -72,7 +74,7 @@ Run `npm test` and `npm run build`. Tests create isolated databases and cover au
 
 ## Deploy to Vercel
 
-Deployment configuration is included, but the project has not been deployed or connected to a production database by this change. Credentials and a Vercel project are still required.
+Deployment configuration is included. New installations require a Vercel project and their own database credentials; existing deployments should retain their configured database and secrets.
 
 1. Create a **libSQL-backed Turso database** and a database authentication token. This adapter uses libSQL, not Turso's separate new database engine. See the [official libSQL driver](https://github.com/tursodatabase/libsql-js).
 2. Import this root project into Vercel. Select the directory containing this README, `vercel.json`, `api/` and `server.mjs`, **not** the separate nested `overbyte/` project. Use Framework Preset **Other** and Node.js **24.x**.

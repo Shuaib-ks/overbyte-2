@@ -176,6 +176,31 @@ test('database failures return a useful status and a correlatable request ID', a
   } finally { f.app.service.state = original; }
 });
 
+test('uncoded runtime driver errors retain sanitized diagnostic causes and a public reference', async (t) => {
+  const f = await fixture(t);
+  const buyer = f.client();
+  await buyer.signup('Runtime Error Kitchen');
+  const entries = [];
+  t.mock.method(console, 'error', (line) => entries.push(JSON.parse(line)));
+  const cause = new Error('HTTP 502 from https://private-db.turso.io/v3/pipeline; authToken=runtime-secret');
+  const failure = new Error('Remote transport failed; Bearer private-runtime-token', { cause });
+  t.mock.method(f.app.service, 'state', () => { throw failure; });
+
+  const response = await buyer.request('/api/state');
+  assert.equal(response.status, 500, 'uncoded errors must not all be classified as database failures');
+  const requestId = response.headers.get('x-request-id');
+  assert.match(requestId, /^[a-f0-9-]{36}$/);
+  assert.ok(response.body.error.includes(requestId));
+  assert.doesNotMatch(JSON.stringify(response.body), /Remote transport|HTTP 502|private-db|runtime-secret|private-runtime-token/);
+  const logged = entries.find((entry) => entry.event === 'overbyte.api_error');
+  assert.ok(logged, 'runtime errors need a structured diagnostic event');
+  assert.equal(logged.requestId, requestId);
+  assert.equal(logged.error.name, 'Error');
+  assert.match(logged.error.message, /Remote transport failed/);
+  assert.match(logged.error.cause.message, /HTTP 502/);
+  assert.doesNotMatch(JSON.stringify(logged), /private-db|runtime-secret|private-runtime-token/);
+});
+
 test('new accounts have empty private workspaces and password-based sessions', async (t) => {
   const f = await fixture(t);
   const client = f.client();
