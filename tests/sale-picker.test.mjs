@@ -11,9 +11,17 @@ const batch = (id, overrides = {}) => ({
 });
 
 test('dashboard exposes Register Sale as its first primary quick action', () => {
-  const html = renderDashboard();
-  assert.match(html, /class="qa-btn primary" id="qa-sale"[^]*?Register Sale<\/button>/);
-  assert.ok(html.indexOf('id="qa-sale"') < html.indexOf('id="qa-add"'));
+  // Charts inject a stylesheet when the otherwise string-based view renders.
+  const originalDocument = globalThis.document;
+  globalThis.document = { createElement: () => ({}), head: { appendChild() {} } };
+  try {
+    const html = renderDashboard();
+    assert.match(html, /class="qa-btn primary" id="qa-sale"[^]*?Register Sale<\/button>/);
+    assert.ok(html.indexOf('id="qa-sale"') < html.indexOf('id="qa-add"'));
+  } finally {
+    if (originalDocument === undefined) delete globalThis.document;
+    else globalThis.document = originalDocument;
+  }
 });
 
 test('sale picker groups trimmed, case-insensitive products and uses the earliest available batch', () => {
