@@ -5,6 +5,7 @@ import { fmtINR, fmtNum as formatNumber, esc, agoFromMins, RISK_META } from "../
 import { selectors, actions, store } from "../store.js";
 import { metricCard, riskPill, statusBadge, aiHeader, aiRec, pageHead, toast, confirmDialog, emptyState } from "../ui.js";
 import { openAddInventory } from "../inventory-form.js";
+import { openSalePicker, openRegisterSale, saleProducts } from "../sale-form.js";
 const fmtNum = (value, decimals) => formatNumber(value, decimals ?? (Number.isInteger(Number(value)) ? 0 : 2));
 
 function greeting() {
@@ -18,7 +19,8 @@ const alertRisk = alert => alert.wasteProb >= 55 ? "high" : alert.wasteProb >= 3
 
 function quickActions() {
   return `<div class="quick-actions">
-    <button class="qa-btn primary" id="qa-add">${icon("plus", 15)}Add Inventory</button>
+    <button class="qa-btn primary" id="qa-sale">${icon("receipt", 15)}Register Sale</button>
+    <button class="qa-btn" id="qa-add">${icon("plus", 15)}Add Inventory</button>
     <a class="qa-btn" href="#/app/surplus/new"><span class="qa-ic">${icon("tag", 15)}</span>Create Surplus Listing</a>
     <a class="qa-btn" href="#/app/surplus"><span class="qa-ic">${icon("search", 15)}</span>Find Surplus</a>
     <a class="qa-btn" href="#/app/notifications"><span class="qa-ic">${icon("bell", 15)}</span>View AI Alerts</a>
@@ -59,11 +61,13 @@ function commandCenter(alerts, inventory) {
 
 function watchlist(inventory) {
   const rows = [...inventory].sort((a, b) => (b.risk?.probability ?? -1) - (a.risk?.probability ?? -1)).slice(0, 5);
+  const available = saleProducts(inventory);
   return `<div class="card" style="padding:0"><div class="card-head"><span class="card-title">Inventory watchlist</span><a class="btn btn-ghost btn-sm" href="#/app/inventory">Full inventory ${icon("arrowRight", 13)}</a></div>
     ${!rows.length ? emptyState({ icon: "package", title: "No inventory yet", sub: "Your highest-priority batches will appear here." }) : `<div style="overflow-x:auto;padding:14px 8px 8px"><table class="tbl" style="min-width:640px"><thead><tr><th>Product</th><th class="td-right">Stock</th><th class="td-right">Demand to expiry</th><th class="td-right">Expiry</th><th>AI status</th></tr></thead><tbody>${rows.map(item => `<tr class="clickable" data-go="#/app/inventory/${encodeURIComponent(item.id)}">
       <td><div class="prod"><span class="p-art">${foodArt(item.product)}</span><div><a class="p-name" href="#/app/inventory/${encodeURIComponent(item.id)}">${esc(item.product)}</a><div class="p-sub">${esc(item.category)}</div></div></div></td>
       <td class="td-right num">${quantity(item.qty, item.unit)}</td><td class="td-right num">${item.forecastAvailable ? quantity(item.demand, item.unit) : "—"}</td><td class="td-right num">${shelf(item.shelfHours)}</td>
-      <td>${item.shelfHours <= 0 ? statusBadge("Expired") : !item.forecastAvailable ? statusBadge("Needs demand data") : item.shortage ? statusBadge("Shortage") : riskPill(item.risk.risk)}</td></tr>`).join("")}</tbody></table></div>`}</div>`;
+      <td>${item.shelfHours <= 0 ? statusBadge("Expired") : !item.forecastAvailable ? statusBadge("Needs demand data") : item.shortage ? statusBadge("Shortage") : riskPill(item.risk.risk)}
+      ${available.some(product => product.product.trim().toLowerCase() === item.product.trim().toLowerCase() && product.unit === item.unit) ? `<button type="button" class="btn btn-ghost btn-sm" data-sale="${esc(item.id)}" aria-label="Register sale of ${esc(item.product)}" style="margin-left:8px">${icon("receipt", 13)}Sell</button>` : ""}</td></tr>`).join("")}</tbody></table></div>`}</div>`;
 }
 
 function activityFeed(s) {
@@ -106,9 +110,14 @@ export function render() {
 }
 
 export function init(root) {
+  root.querySelector("#qa-sale")?.addEventListener("click", openSalePicker);
+  root.querySelectorAll("[data-sale]").forEach(button => button.addEventListener("click", () => {
+    const item = selectors.enrichedInventory().find(item => item.id === button.dataset.sale);
+    if (item) openRegisterSale(item);
+  }));
   root.querySelector("#qa-add")?.addEventListener("click", openAddInventory);
   root.querySelector("#cc-add")?.addEventListener("click", openAddInventory);
-  root.querySelectorAll("[data-go]").forEach(row => row.addEventListener("click", event => { if (!event.target.closest("a")) location.hash = row.dataset.go; }));
+  root.querySelectorAll("[data-go]").forEach(row => row.addEventListener("click", event => { if (!event.target.closest("a,button")) location.hash = row.dataset.go; }));
   root.querySelectorAll("[data-dismiss]").forEach(button => button.addEventListener("click", () => {
     const alert = store.get().alerts.find(item => item.id === button.dataset.dismiss);
     if (!alert) return;

@@ -2,11 +2,62 @@
 import { actions, selectors, store } from "./store.js";
 import { esc, fmtNum as formatNumber } from "./util.js";
 import { openModal, modalHead, closeModal, toast } from "./ui.js";
+import { icon } from "./icons.js";
 
 const fmtNum = value => formatNumber(value, Number.isInteger(Number(value)) ? 0 : 2);
 const productKey = value => String(value).trim().toLowerCase();
 const sameProduct = (a, b) => productKey(a.product) === productKey(b.product) && a.unit === b.unit;
 const dateLabel = value => new Date(value).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
+
+// One choice per product/unit, regardless of how many batches are in stock.
+export function saleProducts(inventory, now = Date.now()) {
+  const groups = new Map();
+  for (const batch of [...inventory].sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt))) {
+    const available = Math.max(0, batch.qty - (batch.reservedQty || 0));
+    if (!(new Date(batch.expiresAt).getTime() > now) || !(available > 0)) continue;
+    const key = JSON.stringify([productKey(batch.product), batch.unit]);
+    if (!groups.has(key)) groups.set(key, { ...batch, available: 0 });
+    groups.get(key).available += available;
+  }
+  return [...groups.values()].map(item => ({ ...item, available: Math.round(item.available * 100) / 100 }))
+    .sort((a, b) => a.product.localeCompare(b.product) || a.unit.localeCompare(b.unit));
+}
+
+export function openSalePicker() {
+  const products = saleProducts(selectors.enrichedInventory());
+  const modal = openModal(`${modalHead("Register Sale", "Choose a product, then enter how much you sold.")}
+    <div class="modal-body col gap-16">
+      ${products.length ? `<div class="field"><label for="sale-search">Find a product</label><input id="sale-search" class="input" type="search" placeholder="Search your inventory…" autocomplete="off"/></div>
+        <div id="sale-products" class="col gap-8" style="max-height:320px;overflow-y:auto"></div><p id="sale-no-results" class="t-sm muted" role="status" hidden>No matching products. Try another name.</p>`
+      : `<p class="t-sm secondary">No stock available to sell. Add inventory first. Expired or reserved stock cannot be sold.</p><a id="sale-open-inventory" class="btn btn-primary" href="#/app/inventory">Open Inventory</a>`}
+      <p class="t-xs muted">Only available stock is shown. We handle batch selection and update your surplus forecast.</p>
+      ${saleHistory(null, 5)}
+    </div>`);
+  modal.style.maxWidth = "480px";
+  modal.querySelector("#sale-open-inventory")?.addEventListener("click", () => closeModal());
+  const list = modal.querySelector("#sale-products");
+  if (!list) return;
+  const render = () => {
+    const query = productKey(modal.querySelector("#sale-search").value);
+    const matches = products.filter(item => productKey(item.product).includes(query));
+    list.innerHTML = matches.map(item => `<button type="button" class="btn btn-secondary" data-sale-product="${esc(item.id)}" style="min-height:54px;justify-content:space-between;white-space:normal;text-align:left;flex-shrink:0">
+      <span>${esc(item.product)} <span class="t-xs muted">${esc(item.unit)}</span></span><span class="row gap-8" style="flex-shrink:0"><span class="t-xs secondary">${fmtNum(item.available)} available</span>${icon("chevronRight", 14)}</span></button>`).join("");
+    modal.querySelector("#sale-no-results").hidden = matches.length > 0;
+  };
+  modal.querySelector("#sale-search").addEventListener("input", render);
+  modal.querySelector("#sale-search").addEventListener("keydown", event => {
+    if (event.key === "Enter" && !event.isComposing) {
+      event.preventDefault();
+      list.querySelector("[data-sale-product]")?.click();
+    }
+  });
+  list.addEventListener("click", event => {
+    const button = event.target.closest("[data-sale-product]");
+    const item = button && products.find(product => product.id === button.dataset.saleProduct);
+    if (item) { closeModal(); openRegisterSale(item); }
+  });
+  render();
+}
 
 export function saleHistory(item = null, limit = 10) {
   const history = (store.get().salesHistory || []).filter(sale => !item || sameProduct(sale, item)).slice(0, limit);
