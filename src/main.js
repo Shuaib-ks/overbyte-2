@@ -5,6 +5,7 @@
 import { store, actions, selectors } from "./store.js";
 import { icon, logoMark, wordmark } from "./icons.js";
 import { esc } from "./util.js";
+import { returningUserRoute, startupView } from "./startup.js";
 import { toast, dropdown, notifItem, avatar, openModal, modalHead, closeModal } from "./ui.js";
 
 import * as landing from "./pages/landing.js";
@@ -220,6 +221,10 @@ function renderRoute() {
   const { route, params } = found;
   const s = store.get();
 
+  if (s.authed && ["login", "signup"].includes(route.view)) {
+    location.replace(store.get().onboarded ? "#/app/dashboard" : "#/onboarding");
+    return;
+  }
   if (route.chrome === "app" && !s.authed) { location.hash = "#/login"; return; }
   if (route.view === "onboarding" && !s.authed) { location.hash = "#/signup"; return; }
   if (route.chrome === "app" && !s.onboarded) { location.hash = "#/onboarding"; return; }
@@ -308,10 +313,12 @@ app.addEventListener("change", (event) => { if (event.target.closest("form")) di
 
 async function bootstrap() {
   ready = false;
-  app.innerHTML = `<main class="auth-wrap"><div class="auth-left"><a href="#/" class="auth-brand-row">${logoMark(30)}${wordmark()}</a><div class="auth-panel"><h1>Opening your workspace</h1><p class="sub" role="status">Connecting to OverByte…</p></div></div></main>`;
+  app.innerHTML = startupView();
   try {
     await actions.bootstrap();
     ready = true;
+    const destination = returningUserRoute(store.get(), location.hash);
+    if (destination) history.replaceState(null, "", destination);
     renderRoute();
   } catch (error) {
     app.innerHTML = `<main class="auth-wrap"><div class="auth-left"><a href="#/" class="auth-brand-row">${logoMark(30)}${wordmark()}</a><div class="auth-panel"><h1>Connection interrupted</h1><p class="sub" role="alert">${esc(error?.message || "OverByte could not connect to your workspace. Please try again.")}</p><button type="button" class="btn btn-primary" id="retry-connection">${icon("refresh", 15)}Try again</button></div></div></main>`;

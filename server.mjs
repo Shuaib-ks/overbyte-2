@@ -5,7 +5,7 @@ import { resolve, dirname, extname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDatabase } from "./server/database.mjs";
 import { describeError } from "./server/diagnostics.mjs";
-import { Service, HttpError } from "./server/service.mjs";
+import { Service, HttpError, SESSION_MAX_AGE } from "./server/service.mjs";
 const root = dirname(fileURLToPath(import.meta.url));
 const cookieToken = (req) =>
   (req.headers.cookie || "")
@@ -35,7 +35,7 @@ export function createApp({
   const db = database || openDatabase(dbPath),
     service = new Service(db);
   const cookie = (token, remove = false) =>
-    `overbyte_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${remove ? 0 : 604800}${secureCookies ? "; Secure" : ""}`;
+    `overbyte_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${remove ? 0 : SESSION_MAX_AGE}${secureCookies ? "; Secure" : ""}`;
   const json = (res, status, data) => {
     res.writeHead(status, {
       "Content-Type": "application/json; charset=utf-8",

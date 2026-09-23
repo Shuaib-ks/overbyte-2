@@ -281,6 +281,24 @@ test('authentication attempt windows reset at fifteen minutes without extending 
   assert.equal(service.one('SELECT reset_at FROM auth_attempts').reset_at, resetAt + 900000);
 });
 
+test('sessions remain valid through day 29, expire at day 30, and logout revokes them immediately', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-09-17T10:00:00.000Z') });
+  const db = openDatabase(':memory:', { config: { driver: 'sqlite' } });
+  t.after(() => db.close());
+  const service = new Service(db), account = credentials('Remembered Kitchen');
+  const signup = service.signup(account), login = service.login(account);
+  t.mock.timers.tick(29 * 86400000);
+  assert.equal(service.session(signup.token).id, signup.user.id);
+  assert.equal(service.session(login.token).id, signup.user.id);
+  service.logout(signup.token);
+  assert.equal(service.session(signup.token), null);
+  assert.equal(service.session(login.token).id, signup.user.id);
+  t.mock.timers.tick(86400000 - 1);
+  assert.equal(service.session(login.token).id, signup.user.id);
+  t.mock.timers.tick(1);
+  assert.equal(service.session(login.token), null);
+});
+
 test('direct serverless handler accepts pre-parsed bodies and issues secure, reusable sessions', async (t) => {
   const f = await handlerFixture(t), account = credentials('Parsed Body Kitchen');
   const signup = await f.request('/api/auth/signup', { method: 'POST', data: account, headers: { 'X-Test-Preparsed': 'object' } });
@@ -291,6 +309,7 @@ test('direct serverless handler accepts pre-parsed bodies and issues secure, reu
   assert.match(setCookie, /; HttpOnly/);
   assert.match(setCookie, /; SameSite=Lax/);
   assert.match(setCookie, /; Secure(?:;|$)/);
+  assert.match(setCookie, /; Max-Age=2592000(?:;|$)/);
   const cookie = setCookie.split(';')[0];
   const saved = await f.request('/api/inventory', {
     method: 'POST', data: inventory(), headers: { 'X-Test-Preparsed': 'object', Cookie: cookie },
@@ -302,7 +321,15 @@ test('direct serverless handler accepts pre-parsed bodies and issues secure, reu
   });
   assert.equal(login.status, 200);
   assert.equal(login.body.state.bizId, signup.body.state.bizId);
+  const loginCookie = login.headers.get('set-cookie');
+  assert.match(loginCookie, /; HttpOnly(?:;|$)/);
+  assert.match(loginCookie, /; Secure(?:;|$)/);
+  assert.match(loginCookie, /; Max-Age=2592000(?:;|$)/);
   assert.equal((await f.request('/api/state', { headers: { Cookie: cookie } })).body.authed, true);
+  const logout = await f.request('/api/auth/logout', { method: 'POST', headers: { Cookie: cookie } });
+  assert.equal(logout.status, 200);
+  assert.match(logout.headers.get('set-cookie'), /; Max-Age=0(?:;|$)/);
+  assert.equal((await f.request('/api/state', { headers: { Cookie: cookie } })).body.authed, false);
 });
 
 test('pre-parsed serverless bodies retain JSON validation and request size limits', async (t) => {

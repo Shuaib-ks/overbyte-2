@@ -7,6 +7,7 @@ import {
 } from "node:crypto";
 import { transaction } from "./database.mjs";
 import { weightedDailySales } from "./sales-forecast.mjs";
+export const SESSION_MAX_AGE = 30 * 24 * 60 * 60;
 import {
   wasteRisk,
   surplusEstimate,
@@ -194,7 +195,7 @@ export class Service {
       "INSERT INTO sessions VALUES(?,?,?)",
       hash(token),
       user.id,
-      new Date(Date.now() + 7 * 86400000).toISOString(),
+      new Date(Date.now() + SESSION_MAX_AGE * 1000).toISOString(),
     );
     return token;
   }
