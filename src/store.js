@@ -56,6 +56,7 @@ export const actions={
   adjustInventory:(id,delta,kind='adjustment')=>mutate(`/inventory/${encodeURIComponent(id)}/adjust`,{delta,kind}),
   recordConsumption:(id,qty)=>mutate(`/inventory/${encodeURIComponent(id)}/consume`,{qty}),
   registerSale:(id,qty,options={})=>mutate(`/inventory/${encodeURIComponent(id)}/sales`,{qty,idempotencyKey:options.idempotencyKey||crypto.randomUUID()}),
+  registerSales:(items,options={})=>mutate('/sales',{items,idempotencyKey:options.idempotencyKey||crypto.randomUUID()}),
   async createListing(p){const result=await mutate('/listings',p);return state.listings.find(l=>l.id===result.id)||result;},
   async publishFromAlert(alertId,p){const alert=state.alerts.find(a=>a.id===alertId);if(!alert)throw new Error('This alert has changed. Refresh and review it again.');return actions.createListing({...p,inventoryItemId:p.inventoryItemId||alert.inventoryItemId});},
   cancelListing:id=>mutate(`/listings/${encodeURIComponent(id)}/cancel`),

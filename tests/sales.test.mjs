@@ -37,6 +37,7 @@ function add(service, user, overrides = {}) {
 const rows = (service, user) => service.inventory(user.business_id);
 const row = (service, user, id) => rows(service, user).find((entry) => entry.id === id);
 const sell = (service, user, id, qty, idempotencyKey = randomUUID()) => service.registerSale(user.business_id, id, { qty, idempotencyKey });
+const sellMany = (service, user, items, idempotencyKey = randomUUID()) => service.registerSales(user.business_id, { items, idempotencyKey });
 
 test('weighted sales average emphasizes recent dates, includes zero-sale dates, and ignores old/future records', () => {
   const result = weightedDailySales([
@@ -103,6 +104,92 @@ test('sale requests are idempotent, reject changed retries, and allow a zero-sto
   const otherProduct = add(service, user, { product: 'Potatoes', qty: 20 });
   rejects(() => sell(service, user, otherProduct, 2, key), 409);
   assert.equal(row(service, user, otherProduct).qty, 20);
+});
+
+test('multi-product sales allocate each product FEFO, respect reservations, and update history and forecasts', (t) => {
+  const { service, account } = fixture(t), user = account();
+  const early = add(service, user, { qty: 4, batch: 'EARLY', expiresAt: future(24) });
+  const later = add(service, user, { qty: 10, batch: 'LATER', expiresAt: future(72) });
+  const potatoes = add(service, user, { product: 'Potatoes', qty: 10 });
+  service.createListing(user.business_id, { inventoryItemId: early, qty: 1, price: 20, minOrder: 1, pickup: 'Today' });
+  const result = sellMany(service, user, [{ inventoryItemId: later, qty: 6 }, { inventoryItemId: potatoes, qty: 2 }]);
+  assert.equal(result.sales.length, 2);
+  assert.deepEqual(result.sales[0].allocations.map((allocation) => [allocation.inventoryItemId, allocation.qty]), [[early, 3], [later, 3]]);
+  assert.deepEqual(result.sales[1].allocations.map((allocation) => [allocation.inventoryItemId, allocation.qty]), [[potatoes, 2]]);
+  assert.equal(row(service, user, early).qty, 1);
+  assert.equal(row(service, user, early).reservedQty, 1);
+  assert.equal(row(service, user, later).qty, 7);
+  assert.equal(row(service, user, potatoes).qty, 8);
+  assert.equal(row(service, user, later).salesDailyAverage, 6);
+  assert.equal(row(service, user, potatoes).salesDailyAverage, 2);
+  assert.equal(row(service, user, potatoes).demandSource, 'sales');
+  assert.deepEqual(new Set(service.salesHistory(user.business_id).map((sale) => sale.id)), new Set(result.sales.map((sale) => sale.id)));
+  assert.equal(service.one("SELECT COUNT(*) n FROM inventory_transactions WHERE kind='retail_sale'").n, 3);
+});
+
+test('a failed product rolls back the whole basket and the same key can retry corrected quantities', (t) => {
+  const { service, account } = fixture(t), user = account();
+  const tomatoes = add(service, user, { qty: 5 });
+  const potatoes = add(service, user, { product: 'Potatoes', qty: 2 });
+  const key = randomUUID();
+  rejects(() => sellMany(service, user, [{ inventoryItemId: tomatoes, qty: 3 }, { inventoryItemId: potatoes, qty: 3 }], key), 409);
+  assert.equal(row(service, user, tomatoes).qty, 5);
+  assert.equal(row(service, user, potatoes).qty, 2);
+  assert.deepEqual(service.salesHistory(user.business_id), []);
+  assert.equal(service.one('SELECT COUNT(*) n FROM inventory_sale_allocations').n, 0);
+  assert.equal(service.one("SELECT COUNT(*) n FROM inventory_transactions WHERE kind='retail_sale'").n, 0);
+  const result = sellMany(service, user, [{ inventoryItemId: tomatoes, qty: 3 }, { inventoryItemId: potatoes, qty: 2 }], key);
+  assert.equal(result.sales.length, 2);
+  assert.equal(row(service, user, tomatoes).qty, 2);
+  assert.equal(row(service, user, potatoes).qty, 0);
+});
+
+test('basket retries are idempotent and reject edited quantities, products, ordering, and line counts', (t) => {
+  const { service, account } = fixture(t), user = account();
+  const tomatoes = add(service, user, { qty: 10 });
+  const potatoes = add(service, user, { product: 'Potatoes', qty: 10 });
+  const carrots = add(service, user, { product: 'Carrots', qty: 10 });
+  const items = [{ inventoryItemId: tomatoes, qty: 3 }, { inventoryItemId: potatoes, qty: 2 }];
+  const key = randomUUID(), first = sellMany(service, user, items, key);
+  assert.deepEqual(sellMany(service, user, items, key), first);
+  for (const edited of [
+    [items[0], { ...items[1], qty: 3 }],
+    [items[0], { inventoryItemId: carrots, qty: 2 }],
+    [...items].reverse(),
+    items.slice(0, 1),
+    [...items, { inventoryItemId: carrots, qty: 1 }],
+  ]) rejects(() => sellMany(service, user, edited, key), 409);
+  assert.equal(row(service, user, tomatoes).qty, 7);
+  assert.equal(row(service, user, potatoes).qty, 8);
+  assert.equal(row(service, user, carrots).qty, 10);
+  assert.equal(service.salesHistory(user.business_id).length, 2);
+  assert.equal(service.one("SELECT COUNT(*) n FROM inventory_transactions WHERE kind='retail_sale'").n, 2);
+  const internalKey = service.one('SELECT idempotency_key FROM inventory_sales WHERE id=?', first.sales[0].id).idempotency_key;
+  assert.ok(internalKey.length <= 100);
+  rejects(() => sell(service, user, tomatoes, 3, internalKey), 400);
+  assert.ok(sell(service, user, tomatoes, 1, key).id);
+  assert.deepEqual(sellMany(service, user, items, key), first);
+});
+
+test('baskets validate ownership, unique product/unit lines and size, and support a single product', (t) => {
+  const { service, account } = fixture(t), user = account(), other = account('Other Kitchen');
+  const tomatoes = add(service, user, { qty: 3 });
+  const sameProduct = add(service, user, { product: 'tomatoes', qty: 2, expiresAt: future(72) });
+  const grams = add(service, user, { unit: 'g', qty: 10 });
+  const foreign = add(service, other, { product: 'Potatoes', qty: 10 });
+  const line = { inventoryItemId: tomatoes, qty: 1 };
+  for (const items of [undefined, null, {}, [], Array(21).fill(line), [null], [line, line], [line, { inventoryItemId: sameProduct, qty: 1 }]])
+    rejects(() => sellMany(service, user, items), 400);
+  rejects(() => sellMany(service, user, [line, { inventoryItemId: foreign, qty: 1 }]), 404);
+  assert.equal(row(service, user, tomatoes).qty, 3);
+  assert.deepEqual(service.salesHistory(user.business_id), []);
+  assert.equal(row(service, other, foreign).qty, 10);
+  const key = randomUUID();
+  const first = sellMany(service, user, [{ inventoryItemId: tomatoes, qty: 3 }], key);
+  assert.equal(first.sales.length, 1);
+  assert.equal(row(service, user, tomatoes).qty, 0);
+  assert.deepEqual(sellMany(service, user, [{ inventoryItemId: tomatoes, qty: 3 }], key), first);
+  assert.equal(sellMany(service, user, [line, { inventoryItemId: grams, qty: 1 }]).sales.length, 2);
 });
 
 test('sale stock, allocations, forecasts, and idempotency survive reopening persistent storage', async (t) => {
@@ -354,6 +441,28 @@ test('authenticated sale API persists history, recalculates after sale/add/adjus
   const after = (await owner.request('/api/state')).body;
   assert.equal(after.inventory[owner.bizId].reduce((sum, entry) => sum + entry.qty, 0), 24);
   assert.equal(after.salesHistory.length, 1);
+});
+
+test('multi-product sale API authenticates ownership and returns the complete basket and refreshed state', async (t) => {
+  const f = await httpFixture(t), owner = f.client(), stranger = f.client(), anonymous = f.client();
+  await owner.signup('HTTP Basket Owner');
+  await stranger.signup('HTTP Other Basket Owner');
+  const tomatoes = (await owner.add({ qty: 10 })).result.id;
+  const potatoes = (await owner.add({ product: 'Potatoes', qty: 10 })).result.id;
+  const payload = { items: [{ inventoryItemId: tomatoes, qty: 3 }, { inventoryItemId: potatoes, qty: 2 }], idempotencyKey: randomUUID() };
+  assert.equal((await anonymous.request('/api/sales', 'POST', payload)).status, 401);
+  assert.equal((await stranger.request('/api/sales', 'POST', payload)).status, 404);
+  const sale = await owner.request('/api/sales', 'POST', payload);
+  assert.equal(sale.status, 200, JSON.stringify(sale.body));
+  assert.equal(sale.body.result.sales.length, 2);
+  assert.equal(sale.body.state.salesHistory.length, 2);
+  assert.equal(sale.body.state.inventory[owner.bizId].find((item) => item.id === tomatoes).qty, 7);
+  assert.equal(sale.body.state.inventory[owner.bizId].find((item) => item.id === potatoes).qty, 8);
+  const retry = await owner.request('/api/sales', 'POST', payload);
+  assert.equal(retry.status, 200);
+  assert.deepEqual(retry.body.result, sale.body.result);
+  assert.equal((await owner.request('/api/sales', 'POST', { ...payload, items: payload.items.slice(0, 1) })).status, 409);
+  assert.deepEqual((await stranger.request('/api/state')).body.salesHistory, []);
 });
 
 test('concurrent sale API requests cannot oversell and each successful sale is atomically FEFO allocated', async (t) => {

@@ -475,84 +475,109 @@ export class Service {
     }));
   }
   registerSale(b, iid, p) {
+    const key = str(p.idempotencyKey, "Sale request key", 100);
+    if (key.startsWith("basket:")) fail("This sale request key prefix is reserved.");
+    return this.tx(() => this.#registerSaleItem(b, this.owned("inventory", iid, b), p.qty, key));
+  }
+  registerSales(b, p) {
+    const key = str(p.idempotencyKey, "Sale request key", 100);
+    if (!Array.isArray(p.items) || p.items.length < 1 || p.items.length > 20)
+      fail("A sale must contain between 1 and 20 products.");
     return this.tx(() => {
-      const item = this.owned("inventory", iid, b);
-      const qty = num(p.qty, "Quantity sold", 0.01);
-      const key = str(p.idempotencyKey, "Sale request key", 100);
-      if (["pcs", "packs"].includes(item.unit) && qty % 1)
-        fail("Piece and pack quantities must be whole numbers.");
-      const prior = this.one(
-        "SELECT * FROM inventory_sales WHERE business_id=? AND idempotency_key=?",
-        b,
-        key,
-      );
-      if (prior) {
-        if (
-          prior.product.toLowerCase() !== item.product.toLowerCase() ||
-          prior.unit !== item.unit ||
-          prior.qty !== qty
-        )
-          fail("This request key was used for a different sale.", 409);
-        return this.saleView(prior);
-      }
-      const stamp = now();
-      const batches = this.all(
-        "SELECT * FROM inventory WHERE business_id=? AND lower(product)=lower(?) AND unit=? AND qty>0 AND expires_at>? ORDER BY expires_at,created_at,id",
-        b,
-        item.product,
-        item.unit,
-        stamp,
-      ).map((batch) => ({
-        ...batch,
-        available: Math.max(
-          0,
-          Math.round((batch.qty - this.committed(batch.id)) * 100),
-        ),
-      }));
-      let remaining = Math.round(qty * 100);
-      const available = batches.reduce(
-        (sum, batch) => sum + batch.available,
-        0,
-      );
-      if (remaining > available)
-        fail(
-          `Only ${available / 100} ${item.unit} is available to sell. Expired stock and marketplace reservations are excluded.`,
-          409,
-        );
-      const saleId = id("sale");
-      this.run(
-        "INSERT INTO inventory_sales VALUES(?,?,?,?,?,?,?)",
-        saleId,
-        b,
-        item.product,
-        item.unit,
-        qty,
-        key,
-        stamp,
-      );
-      for (const batch of batches) {
-        if (!remaining) break;
-        const take = Math.min(remaining, batch.available);
-        if (!take) continue;
-        this.run(
-          "UPDATE inventory SET qty=?,updated_at=? WHERE id=?",
-          (Math.round(batch.qty * 100) - take) / 100,
-          stamp,
-          batch.id,
-        );
-        this.run(
-          "INSERT INTO inventory_sale_allocations VALUES(?,?,?)",
-          saleId,
-          batch.id,
-          take / 100,
-        );
-        this.movement(b, batch.id, "retail_sale", -take / 100);
-        remaining -= take;
-      }
-      return this.saleView(
-        this.one("SELECT * FROM inventory_sales WHERE id=?", saleId),
-      );
+      const prefix = `basket:${hash(key)}:`;
+      const previousCount = this.one(
+        "SELECT COUNT(*) n FROM inventory_sales WHERE business_id=? AND idempotency_key GLOB ?",
+        b, `${prefix}*`,
+      ).n;
+      if (previousCount && previousCount !== p.items.length)
+        fail("This request key was used for a different sale.", 409);
+      const products = new Set();
+      const items = p.items.map((line) => {
+        const iid = str(line?.inventoryItemId, "Inventory item", 100);
+        const item = this.owned("inventory", iid, b);
+        const productKey = JSON.stringify([item.product.toLowerCase(), item.unit]);
+        if (products.has(productKey)) fail("Include each product and unit only once per sale.");
+        products.add(productKey);
+        return { item, qty: line.qty };
+      });
+      return { sales: items.map(({ item, qty }, index) => this.#registerSaleItem(b, item, qty, `${prefix}${index}`)) };
     });
+  }
+  #registerSaleItem(b, item, quantity, key) {
+    const qty = num(quantity, "Quantity sold", 0.01);
+    if (["pcs", "packs"].includes(item.unit) && qty % 1)
+      fail("Piece and pack quantities must be whole numbers.");
+    const prior = this.one(
+      "SELECT * FROM inventory_sales WHERE business_id=? AND idempotency_key=?",
+      b,
+      key,
+    );
+    if (prior) {
+      if (
+        prior.product.toLowerCase() !== item.product.toLowerCase() ||
+        prior.unit !== item.unit ||
+        prior.qty !== qty
+      )
+        fail("This request key was used for a different sale.", 409);
+      return this.saleView(prior);
+    }
+    const stamp = now();
+    const batches = this.all(
+      "SELECT * FROM inventory WHERE business_id=? AND lower(product)=lower(?) AND unit=? AND qty>0 AND expires_at>? ORDER BY expires_at,created_at,id",
+      b,
+      item.product,
+      item.unit,
+      stamp,
+    ).map((batch) => ({
+      ...batch,
+      available: Math.max(
+        0,
+        Math.round((batch.qty - this.committed(batch.id)) * 100),
+      ),
+    }));
+    let remaining = Math.round(qty * 100);
+    const available = batches.reduce(
+      (sum, batch) => sum + batch.available,
+      0,
+    );
+    if (remaining > available)
+      fail(
+        `Only ${available / 100} ${item.unit} is available to sell. Expired stock and marketplace reservations are excluded.`,
+        409,
+      );
+    const saleId = id("sale");
+    this.run(
+      "INSERT INTO inventory_sales VALUES(?,?,?,?,?,?,?)",
+      saleId,
+      b,
+      item.product,
+      item.unit,
+      qty,
+      key,
+      stamp,
+    );
+    for (const batch of batches) {
+      if (!remaining) break;
+      const take = Math.min(remaining, batch.available);
+      if (!take) continue;
+      this.run(
+        "UPDATE inventory SET qty=?,updated_at=? WHERE id=?",
+        (Math.round(batch.qty * 100) - take) / 100,
+        stamp,
+        batch.id,
+      );
+      this.run(
+        "INSERT INTO inventory_sale_allocations VALUES(?,?,?)",
+        saleId,
+        batch.id,
+        take / 100,
+      );
+      this.movement(b, batch.id, "retail_sale", -take / 100);
+      remaining -= take;
+    }
+    return this.saleView(
+      this.one("SELECT * FROM inventory_sales WHERE id=?", saleId),
+    );
   }
   inventory(b) {
     const rows = this.all(

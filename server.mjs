@@ -196,6 +196,8 @@ export function createApp({
         mutationStarted = performance.now();
         if (path === "/api/inventory" && req.method === "POST")
           result = service.addInventory(b, p);
+        else if (path === "/api/sales" && req.method === "POST")
+          result = service.registerSales(b, p);
         else if (
           (m = path.match(/^\/api\/inventory\/([\w-]+)\/sales$/)) &&
           req.method === "POST"
