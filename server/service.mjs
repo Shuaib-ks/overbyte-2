@@ -7,6 +7,7 @@ import {
 } from "node:crypto";
 import { transaction } from "./database.mjs";
 import { weightedDailySales } from "./sales-forecast.mjs";
+import { readStateData } from "./state-data.mjs";
 export const SESSION_MAX_AGE = 30 * 24 * 60 * 60;
 import {
   wasteRisk,
@@ -117,11 +118,24 @@ export class Service {
   constructor(db) {
     this.db = db;
     this.telemetry = null;
+    this.readStatements = new Map();
+    this.transactionDepth = 0;
   }
   query(kind, sql, args) {
     const started = performance.now();
     try {
-      return this.db.prepare(sql)[kind](...args);
+      // Native libSQL prepares over HTTP. Reuse reads only outside transactions:
+      // its prepared statements retain transaction-specific stream behaviour.
+      let statement;
+      if (!this.transactionDepth && kind !== "run" && /^\s*SELECT\b/i.test(sql)) {
+        statement = this.readStatements.get(sql);
+        if (!statement) {
+          statement = this.db.prepare(sql);
+          if (this.readStatements.size >= 64) this.readStatements.delete(this.readStatements.keys().next().value);
+          this.readStatements.set(sql, statement);
+        }
+      } else statement = this.db.prepare(sql);
+      return statement[kind](...args);
     } finally {
       const durationMs = performance.now() - started;
       if (this.telemetry) {
@@ -145,7 +159,9 @@ export class Service {
     return this.query("run", sql, args);
   }
   tx(fn) {
-    return transaction(this.db, fn);
+    this.transactionDepth++;
+    try { return transaction(this.db, fn); }
+    finally { this.transactionDepth--; }
   }
   authAttempt(keys) {
     const stamp = Date.now();
@@ -453,13 +469,13 @@ export class Service {
       ),
     };
   }
-  salesHistory(b) {
-    const sales = this.all(
+  salesHistory(b, data = null) {
+    const sales = data?.history ?? this.all(
       "SELECT * FROM inventory_sales WHERE business_id=? ORDER BY created_at DESC,id DESC LIMIT 100",
       b,
     );
     if (!sales.length) return [];
-    const allocations = this.all(
+    const allocations = data?.allocations ?? this.all(
       "SELECT a.sale_id,a.inventory_id AS inventoryItemId,i.batch,a.qty FROM inventory_sale_allocations a JOIN inventory i ON i.id=a.inventory_id WHERE a.sale_id IN (SELECT id FROM inventory_sales WHERE business_id=? ORDER BY created_at DESC,id DESC LIMIT 100) ORDER BY i.expires_at,i.created_at,i.id",
       b,
     );
@@ -477,110 +493,116 @@ export class Service {
   registerSale(b, iid, p) {
     const key = str(p.idempotencyKey, "Sale request key", 100);
     if (key.startsWith("basket:")) fail("This sale request key prefix is reserved.");
-    return this.tx(() => this.#registerSaleItem(b, this.owned("inventory", iid, b), p.qty, key));
+    return this.tx(() => this.#registerSaleItems(b, [{ inventoryItemId: iid, qty: p.qty }], key)[0]);
   }
   registerSales(b, p) {
     const key = str(p.idempotencyKey, "Sale request key", 100);
     if (!Array.isArray(p.items) || p.items.length < 1 || p.items.length > 20)
       fail("A sale must contain between 1 and 20 products.");
-    return this.tx(() => {
-      const prefix = `basket:${hash(key)}:`;
-      const previousCount = this.one(
-        "SELECT COUNT(*) n FROM inventory_sales WHERE business_id=? AND idempotency_key GLOB ?",
-        b, `${prefix}*`,
-      ).n;
-      if (previousCount && previousCount !== p.items.length)
-        fail("This request key was used for a different sale.", 409);
-      const products = new Set();
-      const items = p.items.map((line) => {
-        const iid = str(line?.inventoryItemId, "Inventory item", 100);
-        const item = this.owned("inventory", iid, b);
-        const productKey = JSON.stringify([item.product.toLowerCase(), item.unit]);
-        if (products.has(productKey)) fail("Include each product and unit only once per sale.");
-        products.add(productKey);
-        return { item, qty: line.qty };
-      });
-      return { sales: items.map(({ item, qty }, index) => this.#registerSaleItem(b, item, qty, `${prefix}${index}`)) };
-    });
+    return this.tx(() => ({ sales: this.#registerSaleItems(b, p.items, `basket:${hash(key)}:`, true) }));
   }
-  #registerSaleItem(b, item, quantity, key) {
-    const qty = num(quantity, "Quantity sold", 0.01);
-    if (["pcs", "packs"].includes(item.unit) && qty % 1)
-      fail("Piece and pack quantities must be whole numbers.");
-    const prior = this.one(
-      "SELECT * FROM inventory_sales WHERE business_id=? AND idempotency_key=?",
-      b,
-      key,
-    );
-    if (prior) {
-      if (
-        prior.product.toLowerCase() !== item.product.toLowerCase() ||
-        prior.unit !== item.unit ||
-        prior.qty !== qty
-      )
-        fail("This request key was used for a different sale.", 409);
-      return this.saleView(prior);
-    }
-    const stamp = now();
-    const batches = this.all(
-      "SELECT * FROM inventory WHERE business_id=? AND lower(product)=lower(?) AND unit=? AND qty>0 AND expires_at>? ORDER BY expires_at,created_at,id",
-      b,
-      item.product,
-      item.unit,
-      stamp,
-    ).map((batch) => ({
-      ...batch,
-      available: Math.max(
-        0,
-        Math.round((batch.qty - this.committed(batch.id)) * 100),
-      ),
+  #registerSaleItems(b, lines, key, basket = false) {
+    const requests = lines.map((line, index) => ({
+      inventoryItemId: str(line?.inventoryItemId, "Inventory item", 100),
+      qty: num(line?.qty, "Quantity sold", 0.01),
+      key: basket ? `${key}${index}` : key,
     }));
-    let remaining = Math.round(qty * 100);
-    const available = batches.reduce(
-      (sum, batch) => sum + batch.available,
-      0,
+    const previous = this.all(
+      `SELECT * FROM inventory_sales WHERE business_id=? AND idempotency_key ${basket ? "GLOB" : "="} ?`,
+      b, basket ? `${key}*` : key,
     );
-    if (remaining > available)
-      fail(
-        `Only ${available / 100} ${item.unit} is available to sell. Expired stock and marketplace reservations are excluded.`,
-        409,
-      );
-    const saleId = id("sale");
-    this.run(
-      "INSERT INTO inventory_sales VALUES(?,?,?,?,?,?,?)",
-      saleId,
-      b,
-      item.product,
-      item.unit,
-      qty,
-      key,
-      stamp,
+    if (previous.length && previous.length !== requests.length)
+      fail("This request key was used for a different sale.", 409);
+    const stamp = now();
+    // Fetch ownership, every matching batch and all reservations in one trip.
+    // BEGIN IMMEDIATE covers this read, FEFO planning and all four bulk writes.
+    const batches = this.all(
+      `WITH selected AS (
+        SELECT DISTINCT lower(product) product,unit FROM inventory
+        WHERE business_id=? AND id IN (SELECT value FROM json_each(?))
+      ), batches AS (
+        SELECT i.*,lower(i.product) product_key FROM inventory i
+        WHERE i.business_id=? AND EXISTS (SELECT 1 FROM selected s WHERE s.product=lower(i.product) AND s.unit=i.unit)
+      ), reservations AS (
+        SELECT inventory_id,remaining qty FROM listings
+        WHERE inventory_id IN (SELECT id FROM batches) AND status='Active' AND expires_at>?
+        UNION ALL
+        SELECT l.inventory_id,o.qty FROM orders o JOIN listings l ON l.id=o.listing_id
+        WHERE l.inventory_id IN (SELECT id FROM batches) AND o.status='Ready for pickup'
+      )
+      SELECT i.*,COALESCE(r.qty,0) reserved FROM batches i
+      LEFT JOIN (SELECT inventory_id,SUM(qty) qty FROM reservations GROUP BY inventory_id) r ON r.inventory_id=i.id
+      ORDER BY i.expires_at,i.created_at,i.id`,
+      b, JSON.stringify(requests.map((request) => request.inventoryItemId)), b, stamp,
     );
-    for (const batch of batches) {
-      if (!remaining) break;
-      const take = Math.min(remaining, batch.available);
-      if (!take) continue;
-      this.run(
-        "UPDATE inventory SET qty=?,updated_at=? WHERE id=?",
-        (Math.round(batch.qty * 100) - take) / 100,
-        stamp,
-        batch.id,
+    const byId = new Map(batches.map((batch) => [batch.id, batch])), products = new Set();
+    const items = requests.map((request) => {
+      const item = byId.get(request.inventoryItemId);
+      if (!item) fail("Inventory item not found.", 404);
+      const productKey = JSON.stringify([item.product.toLowerCase(), item.unit]);
+      if (products.has(productKey)) fail("Include each product and unit only once per sale.");
+      products.add(productKey);
+      if (["pcs", "packs"].includes(item.unit) && request.qty % 1)
+        fail("Piece and pack quantities must be whole numbers.");
+      return { ...request, item };
+    });
+    if (previous.length) {
+      const byKey = new Map(previous.map((sale) => [sale.idempotency_key, sale]));
+      const ordered = items.map(({ item, qty, key: requestKey }) => {
+        const sale = byKey.get(requestKey);
+        if (!sale || sale.product.toLowerCase() !== item.product.toLowerCase() || sale.unit !== item.unit || sale.qty !== qty)
+          fail("This request key was used for a different sale.", 409);
+        return sale;
+      });
+      const allocations = this.all(
+        "SELECT a.sale_id,a.inventory_id AS inventoryItemId,i.batch,a.qty FROM inventory_sale_allocations a JOIN inventory i ON i.id=a.inventory_id WHERE a.sale_id IN (SELECT value FROM json_each(?)) ORDER BY i.expires_at,i.created_at,i.id",
+        JSON.stringify(ordered.map((sale) => sale.id)),
       );
-      this.run(
-        "INSERT INTO inventory_sale_allocations VALUES(?,?,?)",
-        saleId,
-        batch.id,
-        take / 100,
-      );
-      this.movement(b, batch.id, "retail_sale", -take / 100);
-      remaining -= take;
+      return ordered.map((sale) => ({
+        id: sale.id, product: sale.product, unit: sale.unit, qty: sale.qty, createdAt: sale.created_at,
+        allocations: allocations.filter((allocation) => allocation.sale_id === sale.id).map(({ sale_id, ...allocation }) => allocation),
+      }));
     }
-    return this.saleView(
-      this.one("SELECT * FROM inventory_sales WHERE id=?", saleId),
+    const deductions = [], sales = items.map(({ item, qty, key: requestKey }) => {
+      const eligible = batches.filter((batch) => batch.product_key === item.product_key && batch.unit === item.unit && batch.qty > 0 && batch.expires_at > stamp)
+        .map((batch) => ({ ...batch, available: Math.max(0, Math.round((batch.qty - round(batch.reserved)) * 100)) }));
+      let remaining = Math.round(qty * 100);
+      const available = eligible.reduce((sum, batch) => sum + batch.available, 0);
+      if (remaining > available)
+        fail(`Only ${available / 100} ${item.unit} is available to sell. Expired stock and marketplace reservations are excluded.`, 409);
+      const sale = { id: id("sale"), product: item.product, unit: item.unit, qty, key: requestKey, createdAt: stamp, allocations: [] };
+      for (const batch of eligible) {
+        if (!remaining) break;
+        const take = Math.min(remaining, batch.available);
+        if (!take) continue;
+        sale.allocations.push({ inventoryItemId: batch.id, batch: batch.batch, qty: take / 100 });
+        deductions.push({ saleId: sale.id, inventoryItemId: batch.id, qty: take / 100, nextQty: (Math.round(batch.qty * 100) - take) / 100, transactionId: id("txn") });
+        remaining -= take;
+      }
+      return sale;
+    });
+    // Bound JSON keeps both SQL size and remote calls independent of basket size.
+    this.run(
+      "INSERT INTO inventory_sales SELECT json_extract(value,'$.id'),?,json_extract(value,'$.product'),json_extract(value,'$.unit'),json_extract(value,'$.qty'),json_extract(value,'$.key'),? FROM json_each(?)",
+      b, stamp, JSON.stringify(sales),
     );
+    const serialized = JSON.stringify(deductions);
+    this.run(
+      "WITH deductions AS (SELECT json_extract(value,'$.inventoryItemId') id,json_extract(value,'$.nextQty') qty FROM json_each(?)) UPDATE inventory SET qty=(SELECT qty FROM deductions WHERE deductions.id=inventory.id),updated_at=? WHERE business_id=? AND id IN (SELECT id FROM deductions)",
+      serialized, stamp, b,
+    );
+    this.run(
+      "INSERT INTO inventory_sale_allocations SELECT json_extract(value,'$.saleId'),json_extract(value,'$.inventoryItemId'),json_extract(value,'$.qty') FROM json_each(?)",
+      serialized,
+    );
+    this.run(
+      "INSERT INTO inventory_transactions SELECT json_extract(value,'$.transactionId'),?,json_extract(value,'$.inventoryItemId'),'retail_sale',-json_extract(value,'$.qty'),? FROM json_each(?)",
+      b, stamp, serialized,
+    );
+    return sales.map(({ key: requestKey, ...sale }) => sale);
   }
-  inventory(b) {
-    const rows = this.all(
+  inventory(b, data = null) {
+    const rows = data?.inventory ?? this.all(
         "SELECT * FROM inventory WHERE business_id=? ORDER BY expires_at,created_at,id",
         b,
       ),
@@ -589,16 +611,16 @@ export class Service {
     const today = now(),
       key = (product, unit) => `${product.toLowerCase()}|${unit}`,
       keyed = (entries) => new Map(entries.map((row) => [key(row.product, row.unit), row]));
-    const consumptionByProduct = keyed(this.all(
+    const consumptionByProduct = keyed(data?.consumption ?? this.all(
       "SELECT lower(i.product) product,i.unit,COALESCE(SUM(-t.qty),0) qty,MIN(t.created_at) first FROM inventory_transactions t JOIN inventory i ON i.id=t.inventory_id WHERE t.business_id=? AND t.kind='consumption' AND t.created_at>=? GROUP BY lower(i.product),i.unit",
       b, new Date(Date.now() - 7 * 86400000).toISOString(),
     ));
-    const firstSaleByProduct = keyed(this.all(
+    const firstSaleByProduct = keyed(data?.firstSales ?? this.all(
       "SELECT lower(product) product,unit,MIN(created_at) first FROM inventory_sales WHERE business_id=? AND created_at<=? GROUP BY lower(product),unit",
       b, today,
     ));
     const salesByProduct = new Map();
-    for (const sale of this.all(
+    for (const sale of data?.recentSales ?? this.all(
       "SELECT product,unit,qty,created_at AS createdAt FROM inventory_sales WHERE business_id=? AND created_at>=? AND created_at<=?",
       b, new Date(Math.floor(Date.now() / 86400000) * 86400000 - 6 * 86400000).toISOString(), today,
     )) {
@@ -606,14 +628,14 @@ export class Service {
       if (!salesByProduct.has(group)) salesByProduct.set(group, []);
       salesByProduct.get(group).push(sale);
     }
-    const incomingByProduct = keyed(this.all(
+    const incomingByProduct = keyed(data?.incoming ?? this.all(
       "SELECT lower(i.product) product,i.unit,COALESCE(SUM(o.qty),0) n FROM orders o JOIN listings l ON l.id=o.listing_id JOIN inventory i ON i.id=l.inventory_id WHERE o.buyer_id=? AND o.status='Ready for pickup' AND l.expires_at>? GROUP BY lower(i.product),i.unit",
       b, today,
     ));
-    const committedByItem = new Map(this.all(
+    const committedByItem = new Map((data?.committed ?? this.all(
       "SELECT inventory_id,SUM(qty) n FROM (SELECT inventory_id,remaining qty FROM listings WHERE business_id=? AND status='Active' AND expires_at>? UNION ALL SELECT l.inventory_id,o.qty FROM orders o JOIN listings l ON l.id=o.listing_id WHERE l.business_id=? AND o.status='Ready for pickup') GROUP BY inventory_id",
       b, today, b,
-    ).map((row) => [row.inventory_id, round(row.n)]));
+    )).map((row) => [row.inventory_id, round(row.n)]));
     for (const r of rows) {
       const k = key(r.product, r.unit);
       if (!groups.has(k)) groups.set(k, []);
@@ -745,13 +767,13 @@ export class Service {
     }
     return out;
   }
-  alerts(b, inv = this.inventory(b), currentSettings = this.settings(b)) {
+  alerts(b, inv = this.inventory(b), currentSettings = this.settings(b), data = null) {
     if (!currentSettings.autoAlerts) return [];
     const threshold = currentSettings.wasteTarget,
-      dismissals = new Map(this.all(
+      dismissals = new Map((data?.dismissals ?? this.all(
         "SELECT alert_id,fingerprint FROM alert_dismissals WHERE business_id=?",
         b,
-      ).map((row) => [row.alert_id, row.fingerprint])),
+      )).map((row) => [row.alert_id, row.fingerprint])),
       out = [];
     for (const i of inv) {
       const kinds = [];
@@ -799,59 +821,71 @@ export class Service {
     }
     return out;
   }
-  reconcile(b) {
-    this.run(
+  reconcile(b, data = readStateData(this, b)) {
+    const stamp = now();
+    const expired = data.listings.filter(l => l.business_id === b && ["Active", "Reserved"].includes(l.status) && l.expires_at <= stamp);
+    if (expired.length) this.run(
       "UPDATE listings SET status='Expired' WHERE business_id=? AND status IN ('Active','Reserved') AND expires_at<=?",
       b,
-      now(),
+      stamp,
     );
-    const inv = this.inventory(b),
-      settings = this.settings(b),
-      alerts = this.alerts(b, inv, settings);
+    for (const listing of [...data.listings, ...data.recentListings]) {
+      if (listing.business_id === b && ["Active", "Reserved"].includes(listing.status) && listing.expires_at <= stamp) listing.status = "Expired";
+    }
+    const inv = this.inventory(b, data),
+      settings = { ...defaults, ...JSON.parse(data.businesses.find(row => row.id === b).settings) },
+      alerts = this.alerts(b, inv, settings, data);
     const pending = alerts.filter((a) => a.status === "pending");
     const eventKey = (a) => `${a.id}|${a.fingerprint}`;
-    const existing = new Set();
-    for (let offset = 0; offset < pending.length; offset += 100) {
-      const keys = pending.slice(offset, offset + 100).map(eventKey);
-      for (const row of this.all(
-        `SELECT event_key FROM notifications WHERE business_id=? AND event_key IN (${keys.map(() => "?").join(",")})`,
-        b, ...keys,
-      )) existing.add(row.event_key);
-    }
+    const existing = new Set(data.notificationKeys.map(row => row.event_key));
+    const notifications = [];
     for (const a of pending) {
-      if (existing.has(eventKey(a))) continue;
-      this.notify(
-        b,
-        a.kind === "shortage" ? "SHORTAGE" : "AI ALERT",
-        a.kind === "shortage"
+      if (!settings.notifyAI || existing.has(eventKey(a))) continue;
+      notifications.push({
+        id: id("n"), business_id: b,
+        kind: a.kind === "shortage" ? "SHORTAGE" : "AI ALERT",
+        title: a.kind === "shortage"
           ? `${a.product}: projected shortage`
           : a.kind === "expiry"
             ? `${a.product}: batch expired`
             : `${a.product}: surplus projected`,
-        a.kind === "shortage"
+        body: a.kind === "shortage"
           ? `${a.shortage} ${a.unit} short against expected daily use.`
           : a.kind === "expiry"
             ? "This batch has expired. Remove it from usable stock."
             : `${a.surplus.mid} ${a.unit} may remain before expiry. Review your inventory.`,
-        `#/app/inventory/${a.itemId}`,
-        eventKey(a),
-        a.kind === "expiry" ? "critical" : "high",
-        settings,
-      );
+        link: `#/app/inventory/${a.itemId}`, event_key: eventKey(a),
+        priority: a.kind === "expiry" ? "critical" : "high", is_read: 0, created_at: stamp,
+      });
       existing.add(eventKey(a));
+    }
+    if (notifications.length) {
+      // RETURNING contains only rows actually inserted if another instance also
+      // reconciled this business. Never show a fabricated notification ID.
+      const inserted = this.all(`INSERT OR IGNORE INTO notifications
+        SELECT json_extract(value,'$.id'),json_extract(value,'$.business_id'),json_extract(value,'$.kind'),
+          json_extract(value,'$.priority'),json_extract(value,'$.title'),json_extract(value,'$.body'),
+          json_extract(value,'$.link'),json_extract(value,'$.event_key'),0,json_extract(value,'$.created_at')
+        FROM json_each(?) RETURNING *`, JSON.stringify(notifications));
+      data.notifications = [...data.notifications, ...inserted].sort((a, z) => z.created_at.localeCompare(a.created_at)).slice(0, 300);
     }
     const value = inv.reduce((n, i) => n + i.value, 0),
       known = inv.filter((i) => i.forecastAvailable && i.qty > 0),
       risk = known.length
         ? known.reduce((n, i) => n + i.risk.probability, 0) / known.length
         : 0;
-    this.run(
+    const day = stamp.slice(0, 10);
+    const snapshot = data.snapshots.find(row => row.day === day);
+    if (!snapshot || snapshot.inventory_value !== round(value) || snapshot.risk !== round(risk)) this.run(
       "INSERT INTO daily_snapshots VALUES(?,?,?,?) ON CONFLICT(business_id,day) DO UPDATE SET inventory_value=excluded.inventory_value,risk=excluded.risk",
       b,
-      now().slice(0, 10),
+      day,
       round(value),
       round(risk),
     );
+    const current = { business_id: b, day, inventory_value: round(value), risk: round(risk) };
+    if (snapshot) Object.assign(snapshot, current);
+    else data.snapshots.push(current);
     return { inv, alerts, settings };
   }
   createListing(b, p) {
@@ -1278,18 +1312,18 @@ export class Service {
       completedAt: o.completed_at,
     };
   }
-  analytics(b, orders) {
+  analytics(b, orders, data = null) {
     const startDay = new Date(Date.now() - 13 * 86400000)
       .toISOString()
       .slice(0, 10);
     orders = orders.filter((o) => o.created_at.slice(0, 10) >= startDay);
-    const snaps = this.all(
+    const snaps = data?.snapshots ?? this.all(
         "SELECT * FROM daily_snapshots WHERE business_id=? ORDER BY day",
         b,
       ),
       sales = orders.filter((o) => o.seller_id === b && o.picked_at),
       purchases = orders.filter((o) => o.buyer_id === b && o.picked_at),
-      ls = this.all(
+      ls = data?.recentListings ?? this.all(
         "SELECT l.*,i.product,i.unit FROM listings l JOIN inventory i ON i.id=l.inventory_id WHERE l.business_id=? AND l.created_at>=?",
         b,
         startDay,
@@ -1318,11 +1352,11 @@ export class Service {
         sales.filter((o) => ["kg", "g"].includes(unit(o))),
         (o) => (unit(o) === "g" ? o.qty / 1000 : o.qty),
       ),
-      wasteKg: this.one(
+      wasteKg: (data?.waste[0] ?? this.one(
         "SELECT COALESCE(SUM(CASE WHEN i.unit='g' THEN -t.qty/1000.0 ELSE -t.qty END),0) n FROM inventory_transactions t JOIN inventory i ON i.id=t.inventory_id WHERE t.business_id=? AND t.kind='waste' AND i.unit IN ('kg','g') AND t.created_at>=?",
         b,
         startDay,
-      ).n,
+      )).n,
       surplusRevenue: sum(sales, (o) => o.total_paise / 100),
       purchaseSavings: sum(purchases, savings),
       labels: days.map((d) =>
@@ -1362,31 +1396,20 @@ export class Service {
   state(user) {
     if (!user) return { authed: false };
     const b = user.business_id,
-      { inv, alerts, settings } = this.reconcile(b),
-      rawOrders = this.all(
-        "SELECT o.*,i.product,i.unit FROM orders o JOIN listings l ON l.id=o.listing_id JOIN inventory i ON i.id=l.inventory_id WHERE o.buyer_id=? OR o.seller_id=? ORDER BY o.created_at DESC",
-        b,
-        b,
-      ),
-      businessRows = this.all("SELECT * FROM businesses"),
+      data = readStateData(this, b),
+      { inv, alerts, settings } = this.reconcile(b, data),
+      rawOrders = data.orders,
+      businessRows = data.businesses,
       businessById = new Map(businessRows.map((r) => [r.id, r])),
       me = businessById.get(b),
-      orderCounts = new Map(this.all(
-        "SELECT seller_id,COUNT(*) n FROM orders WHERE status IN ('Picked up','Completed') GROUP BY seller_id",
-      ).map((row) => [row.seller_id, row.n])),
+      orderCounts = new Map(data.orderCounts.map((row) => [row.seller_id, row.n])),
       businesses = businessRows.map((r) => this.publicBiz(r, r.id === b, orderCounts.get(r.id) || 0)),
       publicById = new Map(businesses.map((row) => [row.id, row])),
       orders = rawOrders.map((o) => this.orderView(
         o, b, o, businessById.get(o.buyer_id === b ? o.seller_id : o.buyer_id)?.contact || "",
       ));
-    const listingRows = this.all(
-      "SELECT l.*,i.product,i.category,i.unit,i.market,i.batch FROM listings l JOIN inventory i ON i.id=l.inventory_id WHERE l.business_id=? OR (l.status='Active' AND l.remaining>0 AND l.expires_at>?) ORDER BY l.created_at DESC",
-      b,
-      now(),
-    );
-    const interestedByListing = new Map(this.all(
-      "SELECT listing_id,COUNT(*) n FROM orders WHERE status<>'Cancelled' GROUP BY listing_id",
-    ).map((row) => [row.listing_id, row.n]));
+    const listingRows = data.listings;
+    const interestedByListing = new Map(data.interested.map((row) => [row.listing_id, row.n]));
     const listings = listingRows.map((l) => {
       const sellerRow = businessById.get(l.business_id),
         needItem = inv.find(
@@ -1450,10 +1473,7 @@ export class Service {
           : 0,
       };
     });
-    const notifications = this.all(
-      "SELECT * FROM notifications WHERE business_id=? ORDER BY created_at DESC LIMIT 300",
-      b,
-    ).map((n) => ({
+    const notifications = data.notifications.map((n) => ({
       id: n.id,
       biz: b,
       kind: n.kind,
@@ -1465,10 +1485,7 @@ export class Service {
       mins: minutes(n.created_at),
       createdAt: n.created_at,
     }));
-    const sensors = this.all(
-      "SELECT s.*,r.value last_value,r.created_at last_reading_at FROM sensors s LEFT JOIN sensor_readings r ON r.id=(SELECT id FROM sensor_readings WHERE sensor_id=s.id ORDER BY created_at DESC LIMIT 1) WHERE s.business_id=?",
-      b,
-    ).map((s) => {
+    const sensors = data.sensors.map((s) => {
       return {
         id: s.id,
         name: s.name,
@@ -1513,19 +1530,16 @@ export class Service {
       onboarded: !!me.onboarded,
       businesses,
       inventory: { [b]: inv },
-      salesHistory: this.salesHistory(b),
+      salesHistory: this.salesHistory(b, data),
       listings,
       orders,
       alerts,
       notifications,
-      analytics: { [b]: this.analytics(b, rawOrders) },
+      analytics: { [b]: this.analytics(b, rawOrders, data) },
       insights,
       settings,
       sensors,
-      watches: this.all(
-        "SELECT id,product FROM watches WHERE business_id=?",
-        b,
-      ),
+      watches: data.watches,
       syncAt: now(),
       syncedAt: now(),
       error: null,

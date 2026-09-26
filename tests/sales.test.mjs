@@ -127,6 +127,33 @@ test('multi-product sales allocate each product FEFO, respect reservations, and 
   assert.equal(service.one("SELECT COUNT(*) n FROM inventory_transactions WHERE kind='retail_sale'").n, 3);
 });
 
+test('sale database calls remain constant for one product or twenty multi-batch products', (t) => {
+  const { service, account } = fixture(t), user = account();
+  const single = add(service, user, { product: 'Single product', qty: 10 });
+  const lines = Array.from({ length: 20 }, (_, index) => {
+    const product = `Bulk product ${index}`;
+    add(service, user, { product, qty: 2, expiresAt: future(24) });
+    return { inventoryItemId: add(service, user, { product, qty: 10, expiresAt: future(72) }), qty: 5 };
+  });
+  const measure = (operation) => {
+    const telemetry = { dbCalls: 0, dbMs: 0 };
+    service.telemetry = telemetry;
+    try { return { result: operation(), calls: telemetry.dbCalls }; }
+    finally { service.telemetry = null; }
+  };
+  const one = measure(() => sell(service, user, single, 1));
+  const key = randomUUID(), many = measure(() => sellMany(service, user, lines, key));
+  assert.equal(one.calls, 6);
+  assert.equal(many.calls, one.calls, 'multi-batch baskets must not introduce per-line or per-batch database calls');
+  assert.equal(many.result.sales.length, 20);
+  assert.ok(many.result.sales.every((sale) => sale.allocations.length === 2));
+  const replay = measure(() => sellMany(service, user, lines, key));
+  assert.equal(replay.calls, 3);
+  assert.deepEqual(replay.result, many.result);
+  assert.equal(service.salesHistory(user.business_id).length, 21);
+  assert.equal(service.one("SELECT COUNT(*) n FROM inventory_transactions WHERE kind='retail_sale'").n, 41);
+});
+
 test('a failed product rolls back the whole basket and the same key can retry corrected quantities', (t) => {
   const { service, account } = fixture(t), user = account();
   const tomatoes = add(service, user, { qty: 5 });

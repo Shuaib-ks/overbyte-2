@@ -7,6 +7,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 // It exercises transport/parser behavior, not Turso's proprietary server policy.
 const db = new DatabaseSync(':memory:');
 const trace = [];
+const requests = [];
 const stored = new Map();
 if (workerData?.seed) db.exec(workerData.seed);
 
@@ -104,7 +105,11 @@ function pipeline(request) {
     case 'batch': return { type: 'batch', result: batch(request.batch) };
     case 'sequence': db.exec(sqlOf(request)); return { type: 'sequence' };
     case 'get_autocommit': return { type: 'get_autocommit', is_autocommit: !db.isTransaction };
-    case 'close': return { type: 'close' };
+    case 'close':
+      // Closing a real Hrana stream rolls back its open transaction. Enable this
+      // in transaction tests to catch native statements reused across scopes.
+      if (workerData?.strictTransactions && db.isTransaction) db.exec('ROLLBACK');
+      return { type: 'close' };
     case 'store_sql': stored.set(request.sql_id, request.sql); return { type: 'store_sql' };
     case 'close_sql': stored.delete(request.sql_id); return { type: 'close_sql' };
     default: throw new Error(`Unsupported fixture request: ${request.type}`);
@@ -116,6 +121,7 @@ const server = http.createServer(async (request, response) => {
     let body = '';
     for await (const chunk of request) body += chunk;
     const input = JSON.parse(body);
+    requests.push({ path: request.url, types: input.requests?.map((item) => item.type) || ['cursor'] });
     if (/\/v[23]\/cursor$/.test(request.url)) {
       const result = batch(input.batch);
       const lines = [{ baton: 'fixture-stream', base_url: null }];
@@ -151,6 +157,7 @@ const server = http.createServer(async (request, response) => {
 
 parentPort.on('message', ({ id, type }) => {
   if (type === 'trace') parentPort.postMessage({ id, trace: [...trace] });
+  if (type === 'requests') parentPort.postMessage({ id, requests: [...requests] });
 });
 server.listen(0, '127.0.0.1', () => {
   parentPort.postMessage({ url: `http://127.0.0.1:${server.address().port}` });
